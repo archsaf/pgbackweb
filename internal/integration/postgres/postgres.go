@@ -1,14 +1,14 @@
 package postgres
 
 import (
-	"archive/zip"
-	"bytes"
+	// "archive/zip"
+	// "bytes"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 
-	"github.com/eduardolat/pgbackweb/internal/util/strutil"
+	// "github.com/eduardolat/pgbackweb/internal/util/strutil"
 	"github.com/orsinium-labs/enum"
 )
 
@@ -207,64 +207,66 @@ func (c *Client) DumpZip(
 	return reader
 }
 
-// RestoreZip downloads or copies the ZIP from the given url or path, unzips it,
-// and runs the psql command to restore the database.
-//
-// The ZIP file must contain a dump.sql file with the SQL dump to restore.
+// RestoreZip downloads or copies the ZIP from the given url or path,
+// unzips its dump.sql entry on-the-fly and pipes it straight into psql.
 //
 //   - version: PostgreSQL version to use for the restore
 //   - connString: connection string to the database
-//   - isLocal: whether the ZIP file is local or a URL
+//   - isLocal: whether the ZIP file is a local path or HTTP(S)/S3 URL
 //   - zipURLOrPath: URL or path to the ZIP file
 func (Client) RestoreZip(
-	version PGVersion, connString string, isLocal bool, zipURLOrPath string,
+    version PGVersion, connString string, isLocal bool, zipURLOrPath string,
 ) error {
-	workDir, err := os.MkdirTemp("", "pbw-restore-*")
-	if err != nil {
-		return fmt.Errorf("error creating temp dir: %w", err)
-	}
-	defer os.RemoveAll(workDir)
-	zipPath := strutil.CreatePath(true, workDir, "dump.zip")
-	dumpPath := strutil.CreatePath(true, workDir, "dump.sql")
+    // 1) формируем команду загрузки
+    var downloadCmd *exec.Cmd
+    if isLocal {
+        downloadCmd = exec.Command("cat", zipURLOrPath)
+    } else {
+        // вместо сохранения в файл – сразу в stdout
+        downloadCmd = exec.Command("wget", "--no-verbose", "-O", "-", zipURLOrPath)
+    }
 
-	if isLocal {
-		cmd := exec.Command("cp", zipURLOrPath, zipPath)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("error copying ZIP file to temp dir: %s", output)
-		}
-	}
+    // 2) распаковываем из stdin только dump.sql
+    unzipCmd := exec.Command("unzip", "-p", "-", "dump.sql")
 
-	if !isLocal {
-		cmd := exec.Command("wget", "--no-verbose", "-O", zipPath, zipURLOrPath)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("error downloading ZIP file: %s", output)
-		}
-	}
+    // 3) восстанавливаем в базу, читая из stdin
+    psqlCmd := exec.Command(version.Value.PSQL, connString)
 
-	if _, err := os.Stat(zipPath); os.IsNotExist(err) {
-		return fmt.Errorf("zip file not found: %s", zipPath)
-	}
+    // 4) соединяем пайплайном: downloadCmd | unzipCmd | psqlCmd
+    dlOut, err := downloadCmd.StdoutPipe()
+    if err != nil {
+        return fmt.Errorf("restore: cannot create download pipe: %w", err)
+    }
+    unzipCmd.Stdin = dlOut
 
-	cmd := exec.Command("unzip", "-o", zipPath, "dump.sql", "-d", workDir)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("error unzipping ZIP file: %s", output)
-	}
+    uzOut, err := unzipCmd.StdoutPipe()
+    if err != nil {
+        return fmt.Errorf("restore: cannot create unzip pipe: %w", err)
+    }
+    psqlCmd.Stdin = uzOut
 
-	if _, err := os.Stat(dumpPath); os.IsNotExist(err) {
-		return fmt.Errorf("dump.sql file not found in ZIP file: %s", zipPath)
-	}
+    // вывод psql в консоль
+    psqlCmd.Stdout = os.Stdout
+    psqlCmd.Stderr = os.Stderr
 
-	cmd = exec.Command(version.Value.PSQL, connString, "-f", dumpPath)
-	output, err = cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf(
-			"error running psql v%s command: %s",
-			version.Value.Version, output,
-		)
-	}
+    // 5) стартуем всё
+    if err := downloadCmd.Start(); err != nil {
+        return fmt.Errorf("restore: download start failed: %w", err)
+    }
+    if err := unzipCmd.Start(); err != nil {
+        return fmt.Errorf("restore: unzip start failed: %w", err)
+    }
+    if err := psqlCmd.Run(); err != nil {
+        return fmt.Errorf("restore: psql failed: %w", err)
+    }
 
-	return nil
+    // 6) дожидаемся завершения оставшихся процессов
+    if err := unzipCmd.Wait(); err != nil {
+        return fmt.Errorf("restore: unzip wait failed: %w", err)
+    }
+    if err := downloadCmd.Wait(); err != nil {
+        return fmt.Errorf("restore: download wait failed: %w", err)
+    }
+
+    return nil
 }
